@@ -1,0 +1,17 @@
+{
+  "name": "textile-pattern-viewer",
+  "version": "1.0.0",
+  "description": "Real-time textile pattern viewer with tiled/bent fabric mesh, procedural warp-weft textures, verifiable mip chains and footprint filtering",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "node cli/textile.js build --pattern checker && node cli/textile.js build --pattern pinstripe && node cli/textile.js build --pattern directionfield",
+    "verify": "node cli/textile.js verify --all",
+    "test:logic": "node test/headless-logic.test.js",
+    "test:e2e": "node test/e2e-webgl.test.mjs",
+    "serve": "node cli/textile.js serve"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

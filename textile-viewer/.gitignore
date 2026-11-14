@@ -1,0 +1,7 @@
+# Generated verification artifacts (regenerate with `npm run build` / `verify`)
+output/*
+!output/.gitkeep
+
+# Optional Playwright browser harness for the WebGL2 E2E test
+.e2e/
+test-results/

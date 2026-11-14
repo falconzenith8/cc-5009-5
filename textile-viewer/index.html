@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>纺织图案实时展示器 · Textile Pattern Viewer</title>
+<style>
+  :root {
+    --bg: #12141a;
+    --panel: #1b1f29;
+    --panel2: #222734;
+    --line: #2e3546;
+    --text: #e6e9f0;
+    --muted: #9aa3b5;
+    --accent: #d98c6a;
+    --accent2: #7fa8d9;
+    --warn: #e0b341;
+    --err: #e06a6a;
+    --ok: #7fc98f;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  .app { display: grid; grid-template-columns: 1fr 340px; grid-template-rows: 48px 1fr; height: 100vh; }
+  header { grid-column: 1 / 3; display: flex; align-items: center; gap: 16px; padding: 0 18px;
+    background: var(--panel); border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  .stage { position: relative; min-width: 0; min-height: 0; }
+  canvas#view { width: 100%; height: 100%; display: block; cursor: grab; }
+  canvas#view:active { cursor: grabbing; }
+  aside { background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto; padding: 14px; }
+  .group { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px; margin-bottom: 12px; }
+  .group h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em; color: var(--muted);
+    margin: 0 0 10px; }
+  label.row { display: grid; grid-template-columns: 1fr auto; gap: 6px; align-items: center;
+    margin-bottom: 8px; font-size: 12px; }
+  label.row input[type=range] { grid-column: 1 / 3; width: 100%; }
+  label.row .val { color: var(--accent2); font-variant-numeric: tabular-nums; }
+  select, button { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 7px 9px; font-size: 12px; }
+  button { cursor: pointer; margin-top: 6px; }
+  button:hover { border-color: var(--accent2); }
+  button.primary { border-color: var(--accent); color: #ffd9c8; }
+  .seg { display: grid; grid-template-columns: repeat(4, 1fr); gap: 4px; }
+  .seg button { margin: 0; padding: 6px 2px; font-size: 11px; }
+  .seg button.active { background: var(--accent); border-color: var(--accent); color: #1a120d; font-weight: 600; }
+  .hud { position: absolute; left: 12px; top: 12px; background: rgba(18,20,26,.86);
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; min-width: 218px;
+    font-variant-numeric: tabular-nums; backdrop-filter: blur(6px); }
+  .hud table { border-collapse: collapse; width: 100%; }
+  .hud td { padding: 2px 0; font-size: 12px; }
+  .hud td:first-child { color: var(--muted); }
+  .hud td:last-child { text-align: right; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; }
+  .badge.ok { background: rgba(127,201,143,.15); color: var(--ok); }
+  .badge.warn { background: rgba(224,179,65,.15); color: var(--warn); }
+  .badge.err { background: rgba(224,106,106,.15); color: var(--err); }
+  .degrade { margin-top: 8px; font-size: 11px; color: var(--warn); }
+  .degrade .item { padding: 3px 0; border-top: 1px dashed var(--line); }
+  .swatches { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-top: 8px; }
+  .swatch { border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: var(--bg); }
+  .swatch canvas { width: 100%; aspect-ratio: 1; display: block; image-rendering: pixelated; }
+  .swatch .cap { font-size: 10px; color: var(--muted); text-align: center; padding: 3px; }
+  .errbar { height: 14px; background: var(--bg); border-radius: 4px; overflow: hidden; margin: 3px 0 7px; }
+  .errbar > i { display: block; height: 100%; background: linear-gradient(90deg, var(--ok), var(--warn), var(--err)); }
+  .statusline { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .statusline .err-text { color: var(--err); }
+  .rec-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .rec-dot.on { background: var(--err); animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+  .toast { position: absolute; bottom: 16px; left: 50%; transform: translateX(-50%);
+    background: rgba(224,106,106,.95); color: #fff; padding: 8px 16px; border-radius: 8px;
+    display: none; max-width: 80%; }
+  .toast.show { display: block; }
+  .help { position: absolute; right: 12px; bottom: 10px; color: var(--muted); font-size: 11px;
+    background: rgba(18,20,26,.8); padding: 6px 10px; border-radius: 6px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>纺织图案实时展示器</h1>
+    <span class="sub">平铺 / 弯曲织物网格 · 经纬程序纹理 · 多级足迹过滤</span>
+    <span style="flex:1"></span>
+    <span id="glBadge" class="badge warn">初始化中…</span>
+  </header>
+
+  <div class="stage">
+    <canvas id="view"></canvas>
+    <div class="hud">
+      <table>
+        <tr><td>实际纹理层级 LOD</td><td id="hLod">–</td></tr>
+        <tr><td>采样模式</td><td id="hMode">–</td></tr>
+        <tr><td>纹素足迹 (px)</td><td id="hFoot">–</td></tr>
+        <tr><td>各向异性比</td><td id="hAniso">–</td></tr>
+        <tr><td>观察距离</td><td id="hDist">–</td></tr>
+        <tr><td>帧间抖动 (像素)</td><td id="hJitter">–</td></tr>
+      </table>
+      <div id="degrade" class="degrade"></div>
+    </div>
+    <div class="help">左键拖动旋转 · 右键/Shift 拖动平移 · 滚轮缩放</div>
+    <div id="toast" class="toast"></div>
+  </div>
+
+  <aside>
+    <div class="group">
+      <h2>布样与纹理</h2>
+      <label class="row">纹样
+        <select id="pattern">
+          <option value="checker">棋盘格 checker</option>
+          <option value="pinstripe">细条纹 pinstripe</option>
+          <option value="directionfield">已知方向场 direction field</option>
+        </select>
+      </label>
+      <label class="row">基础分辨率
+        <select id="baseSize">
+          <option>64</option><option selected>256</option><option>512</option>
+        </select>
+      </label>
+      <div class="swatches">
+        <div class="swatch"><canvas id="swAlbedo" width="96" height="96"></canvas><div class="cap">颜色图</div></div>
+        <div class="swatch"><canvas id="swNormal" width="96" height="96"></canvas><div class="cap">法线图</div></div>
+        <div class="swatch"><canvas id="swFlow" width="96" height="96"></canvas><div class="cap">方向图</div></div>
+      </div>
+    </div>
+
+    <div class="group">
+      <h2>采样与过滤</h2>
+      <div class="seg" id="modeSeg">
+        <button data-mode="0">显式多级</button>
+        <button data-mode="1">硬件 Mip</button>
+        <button data-mode="2">各向异性</button>
+        <button data-mode="3">点采样</button>
+      </div>
+      <label class="row" style="margin-top:10px">LOD 偏移 <span class="val" id="vBias">0.00</span>
+        <input type="range" id="bias" min="-2" max="3" step="0.05" value="0" />
+      </label>
+      <div id="errPanel"></div>
+      <div class="statusline">过滤误差为各级与基准级的实际 RMSE 运算结果。</div>
+    </div>
+
+    <div class="group">
+      <h2>相机与曲面</h2>
+      <label class="row">观察距离 <span class="val" id="vDist">6.0</span>
+        <input type="range" id="dist" min="2.2" max="20" step="0.1" value="6" />
+      </label>
+      <label class="row">偏航角 <span class="val" id="vYaw">34°</span>
+        <input type="range" id="yaw" min="-180" max="180" step="1" value="34" />
+      </label>
+      <label class="row">俯仰角 <span class="val" id="vPitch">29°</span>
+        <input type="range" id="pitch" min="-80" max="80" step="1" value="29" />
+      </label>
+      <label class="row">织物重复尺度 <span class="val" id="vScale">1.0×</span>
+        <input type="range" id="scale" min="0.25" max="6" step="0.05" value="1" />
+      </label>
+      <label class="row">弯曲幅度 <span class="val" id="vBend">0.55</span>
+        <input type="range" id="bend" min="0" max="1.4" step="0.02" value="0.55" />
+      </label>
+      <label class="row">细分密度 <span class="val" id="vSeg">96</span>
+        <input type="range" id="seg" min="24" max="160" step="8" value="96" />
+      </label>
+    </div>
+
+    <div class="group">
+      <h2>轨迹与导出</h2>
+      <button id="record"><span class="rec-dot" id="recDot"></span> <span id="recordLabel">开始录制相机轨迹</span></button>
+      <button id="snap">保存当前帧 PNG</button>
+      <button id="ref" class="primary">生成参考高采样图 (4× 最近邻)</button>
+      <div class="statusline" id="recStatus">未录制</div>
+    </div>
+  </aside>
+</div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>
