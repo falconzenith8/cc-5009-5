@@ -11,6 +11,10 @@ import { fileURLToPath } from 'node:url';
 import { generatePattern, PATTERNS } from '../src/procedural-textures.js';
 import { buildMipChain, levelErrorAgainstBase, selectLod } from '../src/mipmap.js';
 import { createFabricMesh, recomputeFrame } from '../src/mesh.js';
+import { createWeaveSampler } from '../src/weave-sampler.js';
+import { footprintFromDerivatives, lodFromFootprint, anisotropyFromFootprint } from '../src/sampling-spec.js';
+import { toKernelParams } from '../src/material-params.js';
+import { legacyCreateSampler, legacyToKernelParams } from '../src/textile-render-compat.js';
 import { writePPM, encodePNG, upscaleNearest } from './image-io.js';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -33,6 +37,53 @@ function buildAll(pattern, baseSize) {
     flow: levelErrorAgainstBase(chains.flow, 'vector2'),
   };
   return { gen, chains, errors };
+}
+
+// CPU-reference spot checks through the same sampling kernel the GPU compiles.
+// Every point comes from material-params.js (one strict UI -> kernel
+// conversion) and goes through sampling-spec.js (one footprint/LOD rule), so
+// these numbers describe the actual renderer, not a parallel approximation.
+function samplingChecks(chains, baseSize) {
+  const kernel = toKernelParams({ pitch: 3, baseSize, lodBias: 0, filterMode: 0 });
+  const sampler = createWeaveSampler({
+    chains,
+    params: {
+      textureRepeatPerUv: kernel.textureRepeatPerUv,
+      baseTexelsPerTile: kernel.baseTexelsPerTile,
+      lodBiasLevels: kernel.lodBiasLevels,
+      filterMode: kernel.filterMode,
+      deviceAnisoMax: 16,
+    },
+  });
+  const points = [
+    { uv: [0.11, 0.23], duvdx: [0.012, -0.004], duvdy: [0.003, 0.011] },
+    { uv: [0.47, 0.61], duvdx: [0.0004, 0.0], duvdy: [0.0, 0.0004] },
+    { uv: [0.83, 0.19], duvdx: [0.09, 0.02], duvdy: [-0.01, 0.08] },
+  ];
+  return points.map((p) => {
+    const s = sampler.sample(p);
+    return {
+      uv: p.uv,
+      duvdx: p.duvdx,
+      duvdy: p.duvdy,
+      lod: s.lod,
+      footprintTexels: s.footprint.max,
+      anisotropy: s.aniso,
+      albedoEncoded: s.albedo.slice(0, 3).map((v) => Math.round(v * 255)),
+    };
+  });
+}
+
+// The pre-refactor flat entry must still produce the same kernel parameters.
+function compatibilityCheck(baseSize) {
+  const legacy = { textureScale: 3, baseSize, mipBias: 0, filterMode: 0 };
+  const adapted = legacyToKernelParams(legacy);
+  const fresh = toKernelParams({ pitch: 3, baseSize, lodBias: 0, filterMode: 0 });
+  const same = adapted.textureRepeatPerUv === fresh.textureRepeatPerUv
+    && adapted.baseTexelsPerTile === fresh.baseTexelsPerTile
+    && adapted.lodBiasLevels === fresh.lodBiasLevels
+    && adapted.filterMode === fresh.filterMode;
+  return { legacy, matches: same, converted: adapted };
 }
 
 function cmdBuild({ pattern, size, out }) {
@@ -77,6 +128,12 @@ function cmdBuild({ pattern, size, out }) {
       anisotropy: 'flow alpha, scalar box average',
     },
     periodicity: 'all generators and mip taps wrap with modulo indices; mirrored UV folds remain continuous',
+    samplingUnits: {
+      pitch: 'UI thread-pitch slider = texture tile repeats per UV unit; used as uTextureScale unchanged',
+      footprint: 'base-level texels per device pixel, per screen axis; max/min drive LOD and anisotropy',
+      lod: 'log2(max footprint) + bias, clamped to the chain; identical rule in JSD/GLSL and the HUD',
+      source: 'src/sampling-spec.js',
+    },
     referenceImageFactor: REF_FACTOR,
     levels: chains.albedo.map((l, i) => ({
       level: i,
@@ -231,6 +288,28 @@ function cmdVerify({ pattern, size }) {
   }
   if (orthoErr > 1e-4) failures.push(`tangent/normal orthogonality broken: ${orthoErr.toExponential(2)}`);
 
+  // 6. CPU reference sampler executes the shared kernel and stays within
+  //    range at representative points; footprints/LODs come from the same
+  //    unit contract the shader uses.
+  const refChecks = samplingChecks(chains, size);
+  for (const c of refChecks) {
+    const foot = footprintFromDerivatives(c.duvdx, c.duvdy, 3, size);
+    const expectedLod = lodFromFootprint(foot.max, 0, chains.albedo.length);
+    if (Math.abs(c.footprintTexels - foot.max) > 1e-9) {
+      failures.push(`sampling footprint mismatch at uv ${c.uv}: ${c.footprintTexels} vs ${foot.max}`);
+    }
+    if (Math.abs(c.lod - expectedLod) > 1e-9) {
+      failures.push(`sampling LOD mismatch at uv ${c.uv}: ${c.lod} vs ${expectedLod}`);
+    }
+    if (!c.albedoEncoded.every((v) => v >= 0 && v <= 255)) {
+      failures.push(`sampled albedo out of range at uv ${c.uv}: ${c.albedoEncoded}`);
+    }
+  }
+
+  // 7. The pre-refactor flat entry converts to the identical kernel params.
+  const compat = compatibilityCheck(size);
+  if (!compat.matches) failures.push('legacy textile-render entry no longer converts to the same kernel parameters');
+
   const report = {
     schema: 'textile-verify-report/v1',
     pattern,
@@ -243,6 +322,8 @@ function cmdVerify({ pattern, size }) {
     filterGain,
     worstFilterReduction: worstReduction,
     tangentOrthogonalityMaxError: orthoErr,
+    samplingReference: refChecks,
+    legacyEntryCompatible: compat.matches,
     mipErrors: errors,
     pass: failures.length === 0,
     failures,

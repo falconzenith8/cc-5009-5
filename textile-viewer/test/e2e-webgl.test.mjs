@@ -168,6 +168,79 @@ record('build record has levels + RMSE + semantics',
   rec.levels.some((l) => l.rmseAgainstBase.albedo > 0),
   `levels=${rec?.levels?.length} seed=${rec?.seed}`);
 
+// 11. Material controls drive the sampling kernel: pitch changes the kernel
+//     parameter and the executed footprint, without any parallel scale math.
+await page.selectOption('#pattern', 'checker');
+await page.selectOption('#baseSize', '256');
+await page.evaluate(() => {
+  const el = document.querySelector('#scale');
+  el.value = '1'; el.dispatchEvent(new Event('input'));
+});
+await page.waitForTimeout(400);
+const kernelAt1 = await page.evaluate(() => window.__textile.kernel());
+const footAt1 = await page.evaluate(() => window.__textile.renderer.lastTelemetry.footprintTexels);
+await page.evaluate(() => {
+  const el = document.querySelector('#scale');
+  el.value = '4'; el.dispatchEvent(new Event('input'));
+});
+await page.waitForTimeout(500);
+const kernelAt4 = await page.evaluate(() => window.__textile.kernel());
+const footAt4 = await page.evaluate(() => window.__textile.renderer.lastTelemetry.footprintTexels);
+record('pitch control updates the kernel parameter 1:1',
+  kernelAt1.textureRepeatPerUv === 1 && kernelAt4.textureRepeatPerUv === 4,
+  `pitch ${kernelAt1.textureRepeatPerUv} -> ${kernelAt4.textureRepeatPerUv}`);
+record('executed footprint scales with pitch',
+  Math.abs(footAt4 / footAt1 - 4) < 0.05, `footprint ${footAt1.toFixed(3)} -> ${footAt4.toFixed(3)}`);
+
+// 12. GPU execution evidence: probe values match the CPU reference at the same
+//     sampling points, and the evidence survives a pitch change.
+async function evidenceStats() {
+  return page.evaluate(() => window.__textile.evidence());
+}
+const evidence4 = await evidenceStats();
+record('GPU probe matches CPU reference after pitch change',
+  evidence4 && evidence4.gpuExecuted > 0 && evidence4.maxChannelError <= 4
+  && evidence4.maxLodError <= 0.05 && evidence4.maxFootprintRelativeError <= 0.02,
+  evidence4 ? `points=${evidence4.gpuExecuted} ch<=${evidence4.maxChannelError.toFixed(1)}/255 `
+    + `lodΔ<=${evidence4.maxLodError.toFixed(4)} footΔ<=${(evidence4.maxFootprintRelativeError * 100).toFixed(3)}%`
+    : 'no evidence');
+
+// 13. Filter-mode switch re-runs the evidence under the new decision rule.
+await page.evaluate(() => document.querySelector('#modeSeg button[data-mode="3"]').click());
+await page.waitForTimeout(500);
+const pointEvidence = await evidenceStats();
+await page.evaluate(() => document.querySelector('#modeSeg button[data-mode="0"]').click());
+await page.waitForTimeout(500);
+const chainEvidence = await evidenceStats();
+record('filter-mode switch re-executes evidence for each mode',
+  pointEvidence && chainEvidence && pointEvidence.gpuExecuted > 0 && chainEvidence.gpuExecuted > 0
+  && pointEvidence.maxChannelError <= 4 && chainEvidence.maxChannelError <= 4,
+  `point ch<=${pointEvidence?.maxChannelError?.toFixed(1)} chain ch<=${chainEvidence?.maxChannelError?.toFixed(1)}`);
+
+// 14. Legacy textile-render entry stays compatible through the adapter.
+const legacy = await page.evaluate(() => {
+  try {
+    const kernel = window.__textile.legacyApplyTextileRenderParams({
+      textureScale: 2, baseSize: 256, mipBias: 0, filterMode: 0,
+    });
+    return { ok: true, kernel };
+  } catch (err) {
+    return { ok: false, message: err.message };
+  }
+});
+record('legacy flat textile-render entry converts and applies',
+  legacy.ok && legacy.kernel.textureRepeatPerUv === 2 && legacy.kernel.baseTexelsPerTile === 256,
+  legacy.ok ? JSON.stringify(legacy.kernel.uniforms) : legacy.message);
+
+const legacyMissing = await page.evaluate(() => {
+  try {
+    window.__textile.legacyApplyTextileRenderParams({ textureScale: 2, filterMode: 0 });
+    return { threw: false };
+  } catch (err) { return { threw: true, message: err.message }; }
+});
+record('legacy entry rejects missing fields instead of defaulting',
+  legacyMissing.threw, legacyMissing.message || '');
+
 const failed = results.filter((r) => !r.ok);
 console.log(`\n${results.length - failed.length}/${results.length} E2E checks passed`);
 if (errors.length) console.log('page errors:', errors);

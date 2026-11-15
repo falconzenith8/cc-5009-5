@@ -7,6 +7,7 @@
 // indices, which exactly matches GL_LINEAR_MIPMAP_LINEAR over a periodic tile.
 
 import { wrap } from './math-util.js';
+import { footprintFromCoverage, lodFromFootprint } from './sampling-spec.js';
 
 function boxAverageScalars(src, srcSize, dstSize, pixelSize) {
   const dst = new Uint8ClampedArray(dstSize * dstSize * pixelSize);
@@ -110,14 +111,14 @@ export function levelErrorAgainstBase(chain, kind) {
   });
 }
 
-// Screen-coverage LOD selection (the same formula used in the shader HUD):
-// `tileTexels` is how many DEVICE pixels one texture tile covers on screen.
-// Smaller coverage means each base texel maps to a fraction of a device pixel,
-// so a coarser mip (higher LOD) is required. Mirrors the shader's
-// log2(footprintTexels) rule, where footprint grows as coverage shrinks.
+// Screen-coverage LOD selection. `tileTexels` is how many DEVICE pixels one
+// texture tile covers on screen.
+//
+// Compatibility adapter only: the reciprocal coverage formula lives in
+// sampling-spec.js so the CLI, the HUD and the shader all select levels from
+// the same footprint definition. Zero bias, because the CLI has no UI LOD bias.
 export function selectLod(chain, tileTexels) {
   const baseSize = chain[0].size;
-  const devicePixelsPerBaseTexel = Math.max(tileTexels, 1e-6) / baseSize;
-  const lod = Math.max(0, Math.min(chain.length - 1, -Math.log2(devicePixelsPerBaseTexel)));
-  return lod;
+  const foot = footprintFromCoverage(tileTexels, baseSize);
+  return lodFromFootprint(foot, 0, chain.length);
 }

@@ -9,6 +9,7 @@
     "verify": "node cli/textile.js verify --all",
     "test:logic": "node test/headless-logic.test.js",
     "test:e2e": "node test/e2e-webgl.test.mjs",
+    "test:golden": "node test/sampling-golden.test.mjs",
     "serve": "node cli/textile.js serve"
   },
   "engines": {

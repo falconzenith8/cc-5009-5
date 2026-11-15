@@ -2,6 +2,12 @@
 // own sampling semantics: sRGB albedo is decoded, vector maps are decoded in
 // linear space, and the yarn direction is rotated from texture tangent space
 // into world space before lighting.
+//
+// Coordinate construction, footprint estimation and the LOD/anisotropy filter
+// decision are NOT written here; they are emitted from ./sampling-spec.js so
+// the real shader and the CPU reference share one definition.
+
+import { samplingGlsl } from './sampling-spec.js';
 
 export const VERT = `#version 300 es
 precision highp float;
@@ -60,77 +66,24 @@ vec3 linearToSrgb(vec3 c) {
   c = max(c, vec3(0.0));
   return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
 }
-
-// Footprint: UV derivative lengths mapped into base-level texel units.
-vec2 footprintTexels(vec2 uv, float scale) {
-  vec2 dudx = dFdx(uv) * scale * float(uBaseSize);
-  vec2 dudy = dFdy(uv) * scale * float(uBaseSize);
-  return vec2(length(dudx), length(dudy));
-}
-
-// Triangular-weight elliptical filter over the explicit chain: average two
-// nearest LODs with the fractional part, matching trilinear semantics while
-// letting us report the exact level used.
-vec4 sampleChain(sampler2D s, vec2 uv, float lod, float scale) {
-  vec2 st = fract(uv * scale);
-  float l0 = floor(lod);
-  float f = lod - l0;
-  vec4 a = textureLod(s, st, l0);
-  vec4 b = textureLod(s, st, min(l0 + 1.0, float(uLevelCount) - 1.0));
-  return mix(a, b, f);
-}
-
+${samplingGlsl()}
 void main() {
-  vec2 foot = footprintTexels(vUV, uTextureScale);
-  float footMax = max(foot.x, foot.y);
-  float footMin = min(foot.x, foot.y);
+  vec2 duvdx = dFdx(vUV);
+  vec2 duvdy = dFdy(vUV);
 
-  // Screen-coverage LOD: log2 of the texel footprint. This is the same rule the
-  // JS selectLod() uses for the HUD, so displayed level matches sampled level.
-  float lod = clamp(log2(max(footMax, 1.0)) + uMipBias, 0.0, float(uLevelCount) - 1.0);
-  float aniso = clamp(footMax / max(footMin, 1e-4), 1.0, max(uAnisoMax, 1.0));
-
-  vec4 albEnc, nrmEnc, flowEnc;
-  if (uFilterMode == 3) {
-    // Diagnostic: single base-level point sample, no filtering. Aliasing visible.
-    vec2 st = fract(vUV * uTextureScale);
-    ivec2 ipx = ivec2(st * float(uBaseSize));
-    ipx = ivec2(clamp(ipx, ivec2(0), ivec2(uBaseSize - 1)));
-    albEnc = texelFetch(uAlbedo, ipx, 0);
-    nrmEnc = texelFetch(uNormal, ipx, 0);
-    flowEnc = texelFetch(uFlow, ipx, 0);
-  } else if (uFilterMode == 1) {
-    // Hardware trilinear; GL computes the LOD internally from derivatives.
-    vec2 st = fract(vUV * uTextureScale);
-    albEnc = texture(uAlbedo, st);
-    nrmEnc = texture(uNormal, st);
-    flowEnc = texture(uFlow, st);
-  } else {
-    // Mode 0: explicit chain. Mode 2: same chain with anisotropic widening of
-    // the minor-axis footprint (emulated with extra taps when hardware aniso
-    // extension is absent; capped so cost stays bounded).
-    albEnc = sampleChain(uAlbedo, vUV, lod, uTextureScale);
-    nrmEnc = sampleChain(uNormal, vUV, lod, uTextureScale);
-    flowEnc = sampleChain(uFlow, vUV, lod, uTextureScale);
-    if (uFilterMode == 2 && uAnisoMax <= 1.0 && aniso > 1.5) {
-      // Emulated anisotropic filter: spread extra taps along the MAJOR footprint
-      // axis (the derivative with the larger extent), while keeping the minor
-      // axis at its own LOD. This averages several narrow footprints instead of
-      // one blurry isotropic one, preserving detail at grazing angles.
-      vec2 gradX = dFdx(vUV);
-      vec2 gradY = dFdy(vUV);
-      vec2 major = length(gradX) >= length(gradY) ? gradX : gradY;
-      vec2 duv = major * 0.5;
-      float taps = 3.0;
-      for (int i = -1; i <= 1; i++) {
-        vec2 uv2 = vUV + duv * float(i);
-        albEnc += sampleChain(uAlbedo, uv2, lod, uTextureScale);
-        nrmEnc += sampleChain(uNormal, uv2, lod, uTextureScale);
-        flowEnc += sampleChain(uFlow, uv2, lod, uTextureScale);
-      }
-      albEnc /= taps; nrmEnc /= taps; flowEnc /= taps;
-    }
-  }
+  // The footprint / LOD / anisotropy reported by the telemetry pass is the
+  // exact decision used to sample the albedo map, for all texture families.
+  float lod, footMax, aniso;
+  vec4 albEnc = txSampleMap(uAlbedo, vUV, duvdx, duvdy, uFilterMode,
+    uTextureScale, float(uBaseSize), uMipBias, uLevelCount, uAnisoMax,
+    lod, footMax, aniso);
+  float lodN, footN, anisoN;
+  vec4 nrmEnc = txSampleMap(uNormal, vUV, duvdx, duvdy, uFilterMode,
+    uTextureScale, float(uBaseSize), uMipBias, uLevelCount, uAnisoMax,
+    lodN, footN, anisoN);
+  vec4 flowEnc = txSampleMap(uFlow, vUV, duvdx, duvdy, uFilterMode,
+    uTextureScale, float(uBaseSize), uMipBias, uLevelCount, uAnisoMax,
+    lodN, footN, anisoN);
 
   // Correct per-family decode.
   vec3 albedo = srgbToLinear(albEnc.rgb);

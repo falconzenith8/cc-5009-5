@@ -97,6 +97,7 @@
         <tr><td>各向异性比</td><td id="hAniso">–</td></tr>
         <tr><td>观察距离</td><td id="hDist">–</td></tr>
         <tr><td>帧间抖动 (像素)</td><td id="hJitter">–</td></tr>
+        <tr><td>GPU/CPU 通道误差</td><td id="hAlign">–</td></tr>
       </table>
       <div id="degrade" class="degrade"></div>
     </div>
@@ -139,6 +140,7 @@
       </label>
       <div id="errPanel"></div>
       <div class="statusline">过滤误差为各级与基准级的实际 RMSE 运算结果。</div>
+      <div class="statusline" id="alignStatus">等待首次采样对齐测量…</div>
     </div>
 
     <div class="group">

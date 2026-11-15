@@ -4,12 +4,22 @@
 //   2. tangent-space -> world rotation matches the mesh's deformed tangent frame
 //   3. LOD/footprint selection is monotonic in screen coverage
 //   4. bent mesh normals stay unit length and orthogonal to tangents
+//   5. periodic texture wraps without out-of-range sampling
+//   6. sampling-spec unifies the units/derivative/filter math across paths
+//   7. the CPU reference sampler rejects missing parameters instead of defaulting
+//   8. material parameter conversion separates UI units from kernel units
 // Run: node test/headless-logic.test.js
 
 import { generatePattern } from '../src/procedural-textures.js';
 import { buildMipChain, selectLod } from '../src/mipmap.js';
 import { createFabricMesh } from '../src/mesh.js';
 import { fract, wrap } from '../src/math-util.js';
+import {
+  mirrorFold, repeatTileCoord, footprintFromDerivatives, lodFromFootprint,
+  anisotropyFromFootprint, footprintFromCoverage,
+} from '../src/sampling-spec.js';
+import { createWeaveSampler, decodeFamilies, WeaveSampleError } from '../src/weave-sampler.js';
+import { toKernelParams, uiMaterialParams, MaterialParamError } from '../src/material-params.js';
 
 let failures = 0;
 function check(name, cond, detail = '') {
@@ -110,6 +120,119 @@ console.log('[5] periodic texture wraps without out-of-range sampling');
     }
   }
   check('all wrapped indices in range across negative/positive tiles', ok);
+}
+
+console.log('[6] sampling-spec unifies units and derivative math');
+{
+  // Mesh mirror and sampler fold must be the same function.
+  let mirrorSame = true;
+  for (const t of [0, 0.1, 0.25, 0.5, 0.75, 0.999, 1.4, -2.3]) {
+    const shaderFold = 1 - Math.abs(1 - 2 * (t - Math.floor(t)));
+    if (Math.abs(mirrorFold(t) - shaderFold) > 1e-12) mirrorSame = false;
+  }
+  check('mirrorFold matches the shader fold formula', mirrorSame);
+
+  // A device pixel covering 1/baseSize of a tile is exactly one base texel.
+  const foot = footprintFromDerivatives([1 / 256, 0], [0, 1 / 256], 1, 256);
+  check('one tile-fraction per pixel maps to one base texel', Math.abs(foot.max - 1) < 1e-9,
+    `foot=${foot.max}`);
+
+  // The pitch multiplier scales the footprint linearly and nothing else does.
+  const foot4 = footprintFromDerivatives([1 / 256, 0], [0, 1 / 256], 4, 256);
+  check('pitch multiplies the footprint linearly', Math.abs(foot4.max - 4) < 1e-9,
+    `foot=${foot4.max}`);
+
+  // The legacy coverage adapter and the derivative path agree.
+  const viaCoverage = footprintFromCoverage(256, 256);
+  check('coverage adapter yields the same footprint as derivatives', Math.abs(viaCoverage - 1) < 1e-12);
+
+  // LOD is the log2 of the max footprint, clamped, with bias added.
+  check('LOD = log2(max footprint)', Math.abs(lodFromFootprint(8, 0, 9) - 3) < 1e-12);
+  check('LOD bias shifts by exactly the bias', Math.abs(lodFromFootprint(8, 1.5, 9) - 4.5) < 1e-12);
+  check('LOD clamps to the last level', lodFromFootprint(1e6, 0, 9) === 8);
+
+  // Anisotropy ratio = major/minor, capped by device support.
+  const aniso = anisotropyFromFootprint(16, 2, 4);
+  check('anisotropy ratio capped by device max', aniso === 4, `aniso=${aniso}`);
+
+  // Anisotropic derivatives from an oblique view must produce the same
+  // footprint the telemetry would report (non-uniform scaling case).
+  const oblique = footprintFromDerivatives([0.01, 0.002], [0.0, 0.001], 2, 256);
+  check('oblique, non-uniform derivatives yield ordered major/minor extents',
+    oblique.max >= oblique.min && oblique.max > 1, JSON.stringify(oblique));
+}
+
+console.log('[7] weave-sampler rejects missing parameters instead of defaulting');
+{
+  const gen = generatePattern('checker', 64, 8);
+  const chains = {
+    albedo: buildMipChain(gen.albedo, gen.size, 'scalar'),
+    normal: buildMipChain(gen.normal, gen.size, 'normal3'),
+    flow: buildMipChain(gen.flow, gen.size, 'vector2'),
+  };
+  const point = { uv: [0.3, 0.3], duvdx: [0.004, 0], duvdy: [0, 0.004] };
+  const base = {
+    textureRepeatPerUv: 1, baseTexelsPerTile: 64, lodBiasLevels: 0,
+    filterMode: 0, deviceAnisoMax: 16,
+  };
+
+  const throwsField = (params, field, pointOverride) => {
+    try {
+      createWeaveSampler({ chains, params }).sample({ ...point, ...pointOverride });
+      return false;
+    } catch (err) {
+      return err instanceof WeaveSampleError && err.field.startsWith(field);
+    }
+  };
+  check('missing pitch throws', throwsField({ ...base, textureRepeatPerUv: undefined }, 'textureRepeatPerUv'));
+  check('missing base size throws', throwsField({ ...base, baseTexelsPerTile: undefined }, 'baseTexelsPerTile'));
+  check('missing LOD bias throws', throwsField({ ...base, lodBiasLevels: undefined }, 'lodBiasLevels'));
+  check('missing filter mode throws', throwsField({ ...base, filterMode: undefined }, 'filterMode'));
+  check('missing device anisotropy limit throws', throwsField({ ...base, deviceAnisoMax: undefined }, 'deviceAnisoMax'));
+  check('missing uv derivative throws',
+    (() => { try { createWeaveSampler({ chains, params: base }).sample({ uv: [0, 0], duvdx: [0.004, 0] }); return false; }
+      catch (e) { return e instanceof WeaveSampleError && e.field.startsWith('point.duvdy'); } })());
+  check('hardware-mip mode without a measured driver LOD throws',
+    throwsField({ ...base, filterMode: 1 }, 'point.driverLod'));
+  check('base size must match the uploaded chain',
+    (() => { try { createWeaveSampler({ chains, params: { ...base, baseTexelsPerTile: 128 } }); return false; }
+      catch (e) { return e instanceof WeaveSampleError && e.field.includes('baseSize'); } })());
+
+  // A complete parameter set succeeds and returns finite, unit-consistent data.
+  const sampler = createWeaveSampler({ chains, params: base });
+  const s = sampler.sample(point);
+  const decoded = decodeFamilies(s);
+  const nLen = Math.hypot(...decoded.tsNormal);
+  const fLen = Math.hypot(...decoded.tsFlow);
+  check('complete parameters sample without defaults', Number.isFinite(s.albedo[0]) && Number.isFinite(s.lod));
+  check('decoded normal stays unit length', Math.abs(nLen - 1) < 1e-2, `|n|=${nLen.toFixed(4)}`);
+  check('decoded flow stays unit length', Math.abs(fLen - 1) < 1e-2, `|f|=${fLen.toFixed(4)}`);
+}
+
+console.log('[8] material parameters convert UI units once, strictly');
+{
+  const kernel = toKernelParams({ pitch: 2.5, baseSize: 256, lodBias: -0.5, filterMode: 2 });
+  check('pitch passes through as textureRepeatPerUv', kernel.textureRepeatPerUv === 2.5);
+  check('base size becomes baseTexelsPerTile', kernel.baseTexelsPerTile === 256);
+  check('LOD bias passes through as levels', kernel.lodBiasLevels === -0.5);
+  check('filter mode 2 is the anisotropic key', kernel.filterKey === 'anisotropic');
+  check('uniform names are derived in one place',
+    kernel.uniforms.textureScale === 2.5 && kernel.uniforms.baseSize === 256
+    && kernel.uniforms.mipBias === -0.5 && kernel.uniforms.filterMode === 2);
+
+  const rejects = (input, field) => {
+    try { uiMaterialParams(input); return false; }
+    catch (err) { return err instanceof MaterialParamError && err.field === field; }
+  };
+  check('missing pitch is rejected', rejects({ baseSize: 256, lodBias: 0, filterMode: 0 }, 'pitch'));
+  check('out-of-range pitch is rejected', rejects({ pitch: 99, baseSize: 256, lodBias: 0, filterMode: 0 }, 'pitch'));
+  check('non-listed base size is rejected', rejects({ pitch: 1, baseSize: 100, lodBias: 0, filterMode: 0 }, 'baseSize'));
+  check('unknown filter mode is rejected', rejects({ pitch: 1, baseSize: 256, lodBias: 0, filterMode: 7 }, 'filterMode'));
+  check('missing LOD bias is rejected', rejects({ pitch: 1, baseSize: 256, filterMode: 0 }, 'lodBias'));
+
+  // Pitch range endpoints from the UI slider are accepted unchanged.
+  check('pitch endpoints convert without rescaling',
+    uiMaterialParams({ pitch: '0.25', baseSize: '512', lodBias: '3', filterMode: '3' }).pitch === 0.25);
 }
 
 console.log(failures === 0 ? '\nALL HEADLESS TESTS PASSED' : `\n${failures} TEST(S) FAILED`);

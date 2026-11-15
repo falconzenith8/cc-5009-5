@@ -7,6 +7,7 @@
 // mirrored UV never produces a highlight flip or a visible seam.
 
 import { TAU } from './math-util.js';
+import { mirrorFold } from './sampling-spec.js';
 
 export function createFabricMesh(options = {}) {
   const segments = options.segments ?? 96;
@@ -67,13 +68,12 @@ export function createFabricMesh(options = {}) {
     // Handedness: sign of determinant(T,B,N); mirrored UV tiles flip it.
     tangents[i * 4 + 3] = 1;
 
-    // Mirrored UV layout. Raw repeat coordinate folds every tile:
-    // fold(t) = 1 - |1 - 2*fract(t)| in [0,1], creating symmetric mirrors.
+    // Mirrored UV layout. Raw repeat coordinate folds every tile through the
+    // shared mirror definition in sampling-spec.js.
     const rawU = (gx / segments) * tiles;
     const rawV = (gy / segments) * tiles;
-    const fold = (t) => 1 - Math.abs(1 - 2 * (t - Math.floor(t)));
-    uvs[i * 2] = fold(rawU);
-    uvs[i * 2 + 1] = fold(rawV);
+    uvs[i * 2] = mirrorFold(rawU);
+    uvs[i * 2 + 1] = mirrorFold(rawV);
   }
 
   for (let gy = 0; gy <= segments; gy++) {

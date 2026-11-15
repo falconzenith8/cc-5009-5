@@ -1,8 +1,10 @@
-// WebGL2 renderer for the textile viewer. Owns capability detection, texture
-// upload (with explicit mip chains), camera orbit and per-frame telemetry that
-// the UI displays (actual LOD, footprint, sampling mode, degradation flags).
+// WebGL2 execution boundary for the textile renderer. Owns capability
+// detection, texture upload (with explicit mip chains), camera orbit and the
+// GPU sampling-alignment probe. It receives already-converted kernel
+// parameters (src/material-params.js) and never converts UI units itself.
 
 import { VERT, FRAG, BLIT_VERT, BLIT_FRAG } from './shaders.js';
+import { PROBE_VERT, PROBE_FRAG, PROBE_TARGET_SIZE, PROBE_READ_PIXEL } from './sampling-probe.js';
 
 function compile(gl, type, src) {
   const sh = gl.createShader(type);
@@ -126,9 +128,10 @@ export class TextileRenderer {
       pass: gl.getUniformLocation(this.program, 'uPass'),
     };
     this.capabilities = this.detectCapabilities();
-    this.filterMode = this.capabilities.anisotropic ? 2 : 0;
+    this.filterMode = 0;
     this.mipBias = 0;
     this.textureScale = 1;
+    this.probeProgram = program(gl, PROBE_VERT, PROBE_FRAG);
     this.vao = null;
     this.indexCount = 0;
     this.lastTelemetry = null;
@@ -145,38 +148,49 @@ export class TextileRenderer {
 
   // Allocate (or resize) an RGBA8 + depth16 offscreen target used for either
   // telemetry readback or a persistent snapshot of the visible color pass.
-  ensureTarget(kind, width, height) {
+  // `attachments` > 1 adds extra RGBA8 color buffers for the sampling probe.
+  ensureTarget(kind, width, height, attachments = 1) {
     const gl = this.gl;
     const fboKey = kind + 'Fbo';
     const texKey = kind + 'Tex';
     const wKey = kind + 'W';
     const hKey = kind + 'H';
-    if (this[fboKey] && this[wKey] === width && this[hKey] === height) return;
+    const nKey = kind + 'N';
+    if (this[fboKey] && this[wKey] === width && this[hKey] === height
+      && this[nKey] === attachments) return;
     if (this[fboKey]) {
-      gl.deleteTexture(this[texKey]);
+      for (const t of this[texKey]) gl.deleteTexture(t);
       gl.deleteFramebuffer(this[fboKey]);
     }
-    const tex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    const texes = [];
     const fbo = gl.createFramebuffer();
     gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+    for (let i = 0; i < attachments; i++) {
+      const tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, width, height, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, tex, 0);
+      texes.push(tex);
+    }
     const depthRb = gl.createRenderbuffer();
     gl.bindRenderbuffer(gl.RENDERBUFFER, depthRb);
     gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT16, width, height);
     gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depthRb);
+    if (attachments > 1) {
+      gl.drawBuffers(texes.map((_, i) => gl.COLOR_ATTACHMENT0 + i));
+    }
     const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
     if (status !== gl.FRAMEBUFFER_COMPLETE) {
       throw new Error(`${kind} framebuffer incomplete: 0x${status.toString(16)}`);
     }
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    this[texKey] = tex;
+    this[texKey] = texes;
     this[fboKey] = fbo;
     this[wKey] = width;
     this[hKey] = height;
+    this[nKey] = attachments;
   }
 
   detectCapabilities() {
@@ -209,15 +223,12 @@ export class TextileRenderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     const internal = isSrgb ? gl.SRGB8_ALPHA8 : gl.RGBA8;
-    for (const level of chain) {
+    for (let i = 0; i < chain.length; i++) {
+      const level = chain[i];
       gl.texImage2D(
-        gl.TEXTURE_2D, chain.indexOf(level), internal,
+        gl.TEXTURE_2D, i, internal,
         level.size, level.size, 0, gl.RGBA, gl.UNSIGNED_BYTE, level.data,
       );
-    }
-    const extAniso = gl.getExtension('EXT_texture_filter_anisotropic');
-    if (extAniso && this.filterMode === 2) {
-      gl.texParameterf(gl.TEXTURE_2D, extAniso.TEXTURE_MAX_ANISOTROPY_EXT, this.capabilities.anisoMax);
     }
     return tex;
   }
@@ -234,6 +245,7 @@ export class TextileRenderer {
     };
     this.levelCount = chains.albedo.length;
     this.baseSize = chains.albedo[0].size;
+    this.applyAnisotropy();
   }
 
   setMesh(mesh) {
@@ -261,7 +273,49 @@ export class TextileRenderer {
     this.mesh = mesh;
   }
 
+  // Accepts only an already-converted kernel parameter object from
+  // src/material-params.js. Missing fields throw instead of defaulting, so the
+  // UI can never silently render with parameters it did not set.
+  applyKernelParams(kernel) {
+    if (!kernel || !kernel.uniforms) {
+      throw new Error('renderer: kernel parameters missing (expected toKernelParams() output)');
+    }
+    const u = kernel.uniforms;
+    for (const key of ['textureScale', 'baseSize', 'mipBias', 'filterMode']) {
+      if (u[key] === undefined) throw new Error(`renderer: kernel parameter "${key}" missing`);
+    }
+    this.filterMode = u.filterMode;
+    this.mipBias = u.mipBias;
+    this.textureScale = u.textureScale;
+    if (this.textures) this.applyAnisotropy();
+    this.kernelParams = kernel;
+  }
+
+  // Hardware anisotropy is a texture-object state, so it must be re-applied
+  // whenever the filter mode changes, not only at upload time.
+  applyAnisotropy() {
+    const gl = this.gl;
+    const ext = gl.getExtension('EXT_texture_filter_anisotropic') ||
+      gl.getExtension('WEBKIT_EXT_texture_filter_anisotropic');
+    if (!ext || !this.textures) return;
+    const value = this.filterMode === 2 ? this.capabilities.anisoMax : 1;
+    for (const t of Object.values(this.textures)) {
+      gl.bindTexture(gl.TEXTURE_2D, t);
+      gl.texParameterf(gl.TEXTURE_2D, ext.TEXTURE_MAX_ANISOTROPY_EXT, value);
+    }
+  }
+
+  // View-projection matrix for the current canvas aspect; shared with the
+  // evidence path so CPU-side projections use exactly the GPU's transform.
+  currentViewProj(camera, modelMatrix = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])) {
+    const aspect = this.canvas.width / this.canvas.height;
+    return m4Mul(m4Mul(camera.projMatrix(aspect), camera.viewMatrix()), modelMatrix);
+  }
+
   render(camera, modelMatrix = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1])) {
+    if (!this.kernelParams) {
+      throw new Error('renderer: render() called before applyKernelParams()');
+    }
     const gl = this.gl;
     const aspect = this.canvas.width / this.canvas.height;
     const vp = m4Mul(camera.projMatrix(aspect), camera.viewMatrix());
@@ -340,6 +394,126 @@ export class TextileRenderer {
       camera: { distance: camera.distance, yaw: camera.yaw, pitch: camera.pitch },
     };
     return this.lastTelemetry;
+  }
+
+  // Run the sampling kernel on the GPU for explicit probe points and read the
+  // results back. This is execution evidence: the same GLSL functions the
+  // cloth shader compiles, on the uploaded textures, with per-point screen
+  // derivatives handed in by the caller. Each output is
+  // { albedo:[3], normal:[3], flow:[3], lod, footprint, aniso } in encoded
+  // units, matching what src/weave-sampler.js returns on the CPU.
+  sampleProbe(points) {
+    if (!this.kernelParams) {
+      throw new Error('renderer: sampleProbe() called before applyKernelParams()');
+    }
+    if (!Array.isArray(points) || points.length === 0) {
+      throw new Error('renderer: sampleProbe() needs at least one point');
+    }
+    const gl = this.gl;
+    const floatTarget = this.capabilities.floatBuffer;
+    if (!floatTarget) {
+      throw new Error('renderer: sampling probe needs EXT_color_buffer_float for exact readback');
+    }
+    const vao = this.ensureProbeVao();
+    gl.useProgram(this.probeProgram);
+    const uni = (name) => gl.getUniformLocation(this.probeProgram, name);
+    gl.uniform1i(uni('uAlbedo'), 0);
+    gl.uniform1i(uni('uNormal'), 1);
+    gl.uniform1i(uni('uFlow'), 2);
+    gl.uniform1i(uni('uFilterMode'), this.filterMode);
+    gl.uniform1f(uni('uTextureScale'), this.textureScale);
+    gl.uniform1i(uni('uBaseSize'), this.baseSize);
+    gl.uniform1i(uni('uLevelCount'), this.levelCount);
+    gl.uniform1f(uni('uMipBias'), this.mipBias);
+    gl.uniform1f(uni('uAnisoMax'), this.capabilities.anisotropic ? this.capabilities.anisoMax : 1);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.textures.albedo);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.bindTexture(gl.TEXTURE_2D, this.textures.normal);
+    gl.activeTexture(gl.TEXTURE2);
+    gl.bindTexture(gl.TEXTURE_2D, this.textures.flow);
+
+    this.ensureProbeTarget(PROBE_TARGET_SIZE, PROBE_TARGET_SIZE);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.probeFbo);
+    gl.viewport(0, 0, PROBE_TARGET_SIZE, PROBE_TARGET_SIZE);
+    gl.disable(gl.DEPTH_TEST);
+    gl.bindVertexArray(vao);
+
+    const readF = (attachment) => {
+      const buf = new Float32Array(4);
+      gl.readBuffer(gl.COLOR_ATTACHMENT0 + attachment);
+      gl.readPixels(PROBE_READ_PIXEL, PROBE_READ_PIXEL, 1, 1, gl.RGBA, gl.FLOAT, buf);
+      return Array.from(buf);
+    };
+    const results = [];
+    for (const p of points) {
+      gl.clearColor(0, 0, 0, 0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.uniform2f(uni('uPointUv'), p.uv[0], p.uv[1]);
+      gl.uniform2f(uni('uPointDuvdx'), p.duvdx[0], p.duvdx[1]);
+      gl.uniform2f(uni('uPointDuvdy'), p.duvdy[0], p.duvdy[1]);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+      const a = readF(0);
+      const n = readF(1);
+      const f = readF(2);
+      results.push({
+        albedo: a.slice(0, 3),
+        normal: n.slice(0, 3),
+        flow: f.slice(0, 3),
+        lod: a[3],
+        footprint: n[3],
+        aniso: f[3],
+      });
+    }
+    gl.readBuffer(gl.COLOR_ATTACHMENT0);
+    gl.bindVertexArray(null);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.enable(gl.DEPTH_TEST);
+    this.samplingProbe = {
+      program: 'PROBE_FRAG (sampling-spec GLSL)',
+      points: points.length,
+      executed: results,
+    };
+    return results;
+  }
+
+  // Float render target for the probe; exactness here is what lets the test
+  // assert small footprint/LOD tolerances instead of 1/255 quantization.
+  ensureProbeTarget(width, height) {
+    const gl = this.gl;
+    if (this.probeFbo && this.probeW === width && this.probeH === height) return;
+    if (this.probeFbo) {
+      for (const t of this.probeTex) gl.deleteTexture(t);
+      gl.deleteFramebuffer(this.probeFbo);
+    }
+    const fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    const texes = [];
+    for (let i = 0; i < 3; i++) {
+      const tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, width, height, 0, gl.RGBA, gl.FLOAT, null);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0 + i, gl.TEXTURE_2D, tex, 0);
+      texes.push(tex);
+    }
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1, gl.COLOR_ATTACHMENT2]);
+    const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if (status !== gl.FRAMEBUFFER_COMPLETE) {
+      throw new Error(`probe framebuffer incomplete: 0x${status.toString(16)}`);
+    }
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    this.probeFbo = fbo;
+    this.probeTex = texes;
+    this.probeW = width;
+    this.probeH = height;
+  }
+
+  ensureProbeVao() {
+    if (this.probeVao) return this.probeVao;
+    this.probeVao = this.gl.createVertexArray();
+    return this.probeVao;
   }
 
   screenshot() {
